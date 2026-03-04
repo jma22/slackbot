@@ -3,17 +3,22 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from pathlib import Path
 from dotenv import load_dotenv
 import anthropic
+import sys
 import os
+
+sys.stdout.reconfigure(line_buffering=True)
 
 load_dotenv(dotenv_path=Path('.') / '.env')
 
 app = App(token=os.environ['SLACK_BOT_TOKEN'])
 claude = anthropic.Anthropic()
 
-# channel_id -> list of {"role": ..., "content": ...} messages for Claude context
+# channel_name -> list of {"role": ..., "content": ...} messages for Claude context
 history = {}
 # user_id -> display name cache
 user_names = {}
+# channel_id -> channel name cache
+channel_names = {}
 
 
 def get_user_name(user_id):
@@ -22,10 +27,34 @@ def get_user_name(user_id):
         try:
             result = app.client.users_info(user=user_id)
             profile = result['user']['profile']
-            user_names[user_id] = profile.get('display_name') or profile.get('real_name') or user_id
-        except Exception:
+            name = (
+                profile.get('display_name_normalized')
+                or profile.get('real_name_normalized')
+                or profile.get('real_name')
+                or user_id
+            )
+            user_names[user_id] = name
+            print(f"Resolved user {user_id} -> {name}")
+        except Exception as e:
+            print(f"Failed to resolve user {user_id}: {e}")
             user_names[user_id] = user_id
     return user_names[user_id]
+
+
+def get_channel_name(channel_id):
+    """Get a channel/DM name, caching the result."""
+    if channel_id not in channel_names:
+        try:
+            result = app.client.conversations_info(channel=channel_id)
+            ch = result['channel']
+            if ch.get('is_im'):
+                # For DMs, use the other user's name
+                channel_names[channel_id] = f"DM-{get_user_name(ch['user'])}"
+            else:
+                channel_names[channel_id] = ch.get('name', channel_id)
+        except Exception:
+            channel_names[channel_id] = channel_id
+    return channel_names[channel_id]
 
 
 def load_all_history():
@@ -40,6 +69,12 @@ def load_all_history():
         )
         for channel in result['channels']:
             ch_id = channel['id']
+            # Cache channel name from the listing
+            ch = channel
+            if ch.get('is_im'):
+                channel_names[ch_id] = f"DM-{get_user_name(ch['user'])}"
+            else:
+                channel_names[ch_id] = ch.get('name', ch_id)
             load_channel_history(ch_id, bot_user_id)
         cursor = result.get('response_metadata', {}).get('next_cursor')
         if not cursor:
@@ -49,11 +84,12 @@ def load_all_history():
 
 def load_channel_history(channel_id, bot_user_id):
     """Load recent messages from a single channel into the history dict."""
+    ch_name = get_channel_name(channel_id)
     msgs = []
     try:
         result = app.client.conversations_history(channel=channel_id, limit=50)
     except Exception as e:
-        print(f"Could not load history for {channel_id}: {e}")
+        print(f"Could not load history for {ch_name}: {e}")
         return
     # messages come newest-first, reverse for chronological order
     for msg in reversed(result.get('messages', [])):
@@ -72,37 +108,51 @@ def load_channel_history(channel_id, bot_user_id):
         else:
             msgs.append({"role": role, "content": content})
     if msgs:
-        history[channel_id] = msgs
+        history[ch_name] = msgs
+
+
+def history_to_string():
+    lines = []
+    for ch_name, msgs in history.items():
+        lines.append(f"--- {ch_name} ---")
+        for msg in msgs:
+            speaker = "Bot" if msg['role'] == "assistant" else msg['content'].split(":")[0]
+            text = msg['content'] if msg['role'] == "assistant" else ":".join(msg['content'].split(":")[1:]).strip()
+            lines.append(f"{speaker}: {text}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 @app.event("message")
 def reply_to_message(message, say):
     if message.get('subtype') == 'bot_message' or message.get('bot_id'):
         return
-    ch_id = message['channel']
+    ch_name = get_channel_name(message['channel'])
     user_text = message['text']
     user_name = get_user_name(message.get('user', ''))
-    print(f"{user_name}: {user_text}")
+    print(f"[{ch_name}] {user_name}: {user_text}")
 
-    if ch_id not in history:
-        history[ch_id] = []
+    if ch_name not in history:
+        history[ch_name] = []
 
-    history[ch_id].append({"role": "user", "content": f"{user_name}: {user_text}"})
+    history[ch_name].append({"role": "user", "content": f"{user_name}: {user_text}"})
 
     response = claude.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1024,
-        messages=history[ch_id],
+        messages=history[ch_name],
     )
     reply = response.content[0].text
-    print(f"Claude: {reply}")
+    print(f"[{ch_name}] Claude: {reply}")
 
-    history[ch_id].append({"role": "assistant", "content": reply})
+    history[ch_name].append({"role": "assistant", "content": reply})
     say(reply)
-
 
 if __name__ == "__main__":
     load_all_history()
-    print(history)
+    for ch_name, msgs in history.items():
+        print(f"\n--- {ch_name} ---")
+        for msg in msgs:
+            print(f"  [{msg['role']}] {msg['content'][:100]}")
     app.client.chat_postMessage(channel='#general', text='Bot is online!')
     SocketModeHandler(app, os.environ['SLACK_APP_TOKEN']).start()
