@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 import anthropic
 import sys
 import os
+from pydantic import BaseModel
+
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -116,11 +118,74 @@ def history_to_string():
     for ch_name, msgs in history.items():
         lines.append(f"--- {ch_name} ---")
         for msg in msgs:
-            speaker = "Bot" if msg['role'] == "assistant" else msg['content'].split(":")[0]
+            speaker = "weewoo" if msg['role'] == "assistant" else msg['content'].split(":")[0]
             text = msg['content'] if msg['role'] == "assistant" else ":".join(msg['content'].split(":")[1:]).strip()
             lines.append(f"{speaker}: {text}")
         lines.append("")
     return "\n".join(lines)
+
+
+class ReplyDecision(BaseModel):
+    need_reply: bool
+    reason: str
+    channel_to_reply: str = None
+    reply_content: str = None
+
+class ReplyRequest(BaseModel):
+    replies: list[ReplyDecision]
+
+
+def get_channel_id(channel_name):
+    """Reverse lookup: channel name -> channel ID."""
+    for ch_id, ch_name in channel_names.items():
+        if ch_name == channel_name:
+            return ch_id
+    return None
+
+
+def check_if_need_reply():
+    history_string = history_to_string()
+    prompt = f"""You are a Slack bot named weewoo. Given the conversation history below, determine if you need to reply in any channel.
+
+You should reply if:
+- Someone directly asked you a question or mentioned you
+- A conversation is directed at you or waiting for your response
+- The last message in a channel is from a user (not you) and seems to expect a response
+
+You should NOT reply if:
+- You already replied and no new user messages came after
+- The conversation doesn't involve you
+- Messages are between other users and don't need your input
+
+Conversation history:
+{history_string}
+
+Return a list of replies you need to send. For each, include the exact channel name from the history and your reply content."""
+
+    print(prompt)
+    response = claude.messages.parse(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+        response_model=ReplyRequest,
+    )
+    print(response.replies)
+
+    for decision in response.replies:
+        if not decision.need_reply:
+            continue
+        ch_id = get_channel_id(decision.channel_to_reply)
+        if not ch_id:
+            print(f"Could not find channel: {decision.channel_to_reply}")
+            continue
+        print(f"[{decision.channel_to_reply}] weewoo: {decision.reply_content}")
+        app.client.chat_postMessage(channel=ch_id, text=decision.reply_content)
+        # Update history
+        ch_name = decision.channel_to_reply
+        if ch_name not in history:
+            history[ch_name] = []
+        history[ch_name].append({"role": "assistant", "content": decision.reply_content})
+
 
 
 @app.event("message")
@@ -150,9 +215,7 @@ def reply_to_message(message, say):
 
 if __name__ == "__main__":
     load_all_history()
-    for ch_name, msgs in history.items():
-        print(f"\n--- {ch_name} ---")
-        for msg in msgs:
-            print(f"  [{msg['role']}] {msg['content'][:100]}")
-    app.client.chat_postMessage(channel='#general', text='Bot is online!')
+    print(history_to_string())
+    
+    # app.client.chat_postMessage(channel='#general', text='Bot is online!')
     SocketModeHandler(app, os.environ['SLACK_APP_TOKEN']).start()
