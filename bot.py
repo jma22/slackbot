@@ -8,7 +8,7 @@ import os
 from pydantic import BaseModel
 
 
-sys.stdout.reconfigure(line_buffering=True)
+sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
 
 load_dotenv(dotenv_path=Path('.') / '.env')
 
@@ -164,32 +164,33 @@ Return a list of replies you need to send. For each, include the exact channel n
 
     print(prompt)
     response = claude.messages.parse(
-        model="claude-sonnet-4-20250514",
+        model="claude-opus-4-6",
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
-        response_model=ReplyRequest,
+        output_format=ReplyRequest,
     )
-    print(response.replies)
+    
+    parsed = response.content[0].parsed_output
+    print(f"Claude response: {parsed}")
+    for reply in parsed.replies:
+        if reply.need_reply and reply.channel_to_reply and reply.reply_content:
+            ch_id = get_channel_id(reply.channel_to_reply)
+            if ch_id:
+                app.client.chat_postMessage(channel=ch_id, text=reply.reply_content)
+                update_history(reply.channel_to_reply, "assistant", f"weewoo: {reply.reply_content}")
+            else:
+                print(f"Could not find channel ID for {reply.channel_to_reply}")
 
-    for decision in response.replies:
-        if not decision.need_reply:
-            continue
-        ch_id = get_channel_id(decision.channel_to_reply)
-        if not ch_id:
-            print(f"Could not find channel: {decision.channel_to_reply}")
-            continue
-        print(f"[{decision.channel_to_reply}] weewoo: {decision.reply_content}")
-        app.client.chat_postMessage(channel=ch_id, text=decision.reply_content)
-        # Update history
-        ch_name = decision.channel_to_reply
-        if ch_name not in history:
-            history[ch_name] = []
-        history[ch_name].append({"role": "assistant", "content": decision.reply_content})
 
+
+def update_history(ch_name, role, content):
+    if ch_name not in history:
+        history[ch_name] = []
+    history[ch_name].append({"role": role, "content": content})
 
 
 @app.event("message")
-def reply_to_message(message, say):
+def reply_to_message(message):
     if message.get('subtype') == 'bot_message' or message.get('bot_id'):
         return
     ch_name = get_channel_name(message['channel'])
@@ -197,21 +198,8 @@ def reply_to_message(message, say):
     user_name = get_user_name(message.get('user', ''))
     print(f"[{ch_name}] {user_name}: {user_text}")
 
-    if ch_name not in history:
-        history[ch_name] = []
-
-    history[ch_name].append({"role": "user", "content": f"{user_name}: {user_text}"})
-
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        messages=history[ch_name],
-    )
-    reply = response.content[0].text
-    print(f"[{ch_name}] Claude: {reply}")
-
-    history[ch_name].append({"role": "assistant", "content": reply})
-    say(reply)
+    update_history(ch_name, "user", f"{user_name}: {user_text}")
+    check_if_need_reply()
 
 if __name__ == "__main__":
     load_all_history()
