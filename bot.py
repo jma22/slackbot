@@ -8,6 +8,7 @@ import sys
 import os
 import time
 from pydantic import BaseModel
+from typing import List
 
 
 sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
@@ -17,8 +18,17 @@ load_dotenv(dotenv_path=Path('.') / '.env')
 app = App(token=os.environ['SLACK_BOT_TOKEN'])
 claude = anthropic.Anthropic()
 
+class HistoryObject(BaseModel):
+    role: str
+    content: str
+    user_id: str = None
+    channel_id: str = None
+    is_new: bool = False
+
+
+
 # channel_name -> list of {"role": ..., "content": ...} messages for Claude context
-history = {}
+history : dict[str, List[HistoryObject]] = {}
 # user_id -> display name cache
 user_names = {}
 # channel_id -> channel name cache
@@ -36,6 +46,7 @@ def save_personas():
 
 personas = load_personas()
 print(personas)
+
 
 
 def get_user_name(user_id):
@@ -102,7 +113,7 @@ def load_all_history():
 def load_channel_history(channel_id, bot_user_id):
     """Load recent messages from a single channel into the history dict."""
     ch_name = get_channel_name(channel_id)
-    msgs = []
+    msgs: List[HistoryObject] = []
     try:
         result = app.client.conversations_history(channel=channel_id, limit=50)
     except Exception as e:
@@ -120,10 +131,10 @@ def load_channel_history(channel_id, bot_user_id):
         role = "assistant" if is_bot else "user"
         content = text if is_bot else f"{get_user_name(user_id)}: {text}"
         # Merge consecutive same-role messages
-        if msgs and msgs[-1]['role'] == role:
-            msgs[-1]['content'] += "\n" + content
+        if msgs and msgs[-1].role == role:
+            msgs[-1].content += "\n" + content
         else:
-            msgs.append({"role": role, "content": content})
+            msgs.append(HistoryObject(role=role, content=content, user_id=user_id, channel_id=channel_id, is_new=False))
     if msgs:
         history[ch_name] = msgs
 
@@ -133,9 +144,10 @@ def history_to_string():
     for ch_name, msgs in history.items():
         lines.append(f"--- {ch_name} ---")
         for msg in msgs:
-            speaker = "weewoo" if msg['role'] == "assistant" else msg['content'].split(":")[0]
-            text = msg['content'] if msg['role'] == "assistant" else ":".join(msg['content'].split(":")[1:]).strip()
-            lines.append(f"{speaker}: {text}")
+            prefix = "[NEW] " if msg.is_new else ""
+            speaker = "weewoo" if msg.role == "assistant" else msg.content.split(":")[0]
+            text = msg.content if msg.role == "assistant" else ":".join(msg.content.split(":")[1:]).strip()
+            lines.append(f"{prefix}{speaker}: {text}")
         lines.append("")
     return "\n".join(lines)
 
@@ -172,6 +184,7 @@ def get_channel_id(channel_name):
 
 
 def check_if_need_reply(persona):
+    print("Checking if need to reply for persona:", persona['name'])
     history_string = history_to_string()
     prompt = f"""you are {persona['name']}, a {persona['role']} at a company, chatting in slack with coworkers.
 your vibe: casual, real, like a normal person texting at work. you have opinions and you share them.
@@ -184,20 +197,22 @@ style rules — follow these strictly:
 - contractions always (don't, can't, it's)
 - never sound like an assistant or ai. no bullet points, no headers, no 'great question'
 
-given the slack conversation history below, decide if you need to reply in any channel.
+messages marked with [NEW] are new and unread. only respond to [NEW] messages.
 
 reply if:
-- someone's asking something relevant to your work as a {persona['role']} or something you'd naturally have a take on
-- a conversation is directed at you or waiting for your response
+- a [NEW] message is asking something relevant to your work as a {persona['role']} or something you'd naturally have a take on
+- a [NEW] message is directed at you or waiting for your response
 
 do NOT reply if:
+- there are no [NEW] messages in a channel
 - you already replied and no new messages came after
-- the conversation has nothing to do with you or your expertise
+- the [NEW] messages have nothing to do with you or your expertise
+- the [NEW] messages are between other users and don't need your input
 
 conversation history:
 {history_string}
 
-return a list of replies to send. only reply in channels where it makes sense for a {persona['role']} to chime in."""
+return a list of replies to send. only reply in channels where [NEW] messages exist and it makes sense for a {persona['role']} to chime in."""
 
     print(prompt)
     response = claude.messages.parse(
@@ -225,16 +240,17 @@ return a list of replies to send. only reply in channels where it makes sense fo
                     username=persona['name'],
                     icon_emoji=persona.get('icon_emoji', ':bust_in_silhouette:'),
                 )
-                update_history(reply.channel_to_reply, "assistant", reply.reply_content)
+                update_history(reply.channel_to_reply, "assistant", reply.reply_content, is_new = False)
             else:
                 print(f"Could not find channel ID for {reply.channel_to_reply}")
 
 
 
-def update_history(ch_name, role, content):
+
+def update_history(ch_name, role, content, is_new=True):
     if ch_name not in history:
         history[ch_name] = []
-    history[ch_name].append({"role": role, "content": content})
+    history[ch_name].append(HistoryObject(role=role, content=content, is_new=is_new))
 
 
 @app.event("message")
@@ -249,6 +265,11 @@ def reply_to_message(message):
     update_history(ch_name, "user", f"{user_name}: {user_text}")
     for persona in personas.values():
         check_if_need_reply(persona)
+    # Mark all messages as no longer new
+    for msgs in history.values():
+        for msg in msgs:
+            msg.is_new = False
+
     
 
 if __name__ == "__main__":
