@@ -11,7 +11,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from .store import load, render
-from .queue import init_notify, on_new_msg, render_channel
+from .queue import on_new_msg, render_channel
 from .ingest import on_message, do_catchup, init_dm_cursors, poll_dms
 
 DM_POLL_INTERVAL = 5
@@ -19,10 +19,10 @@ DM_POLL_INTERVAL = 5
 
 def start():
     """Initialize Slack, load history, start Socket Mode + DM polling."""
-    from ..slack import init as init_slack, join_all_public_channels, bot_client
+    from .api import init as init_api, join_all_public_channels, bot_client
 
     print("Initializing Slack...")
-    init_slack()
+    init_api()
     print("Joining public channels...")
     join_all_public_channels()
     print("Initializing DM cursors...")
@@ -53,9 +53,6 @@ def start():
     threading.Thread(target=handler.start, daemon=True).start()
     print("Socket Mode connected")
 
-    # Async notification
-    init_notify()
-
     # DM polling
     def dm_poll_loop():
         while True:
@@ -70,7 +67,7 @@ def start():
 
 def list_channels(agent) -> list[str]:
     """Return channel IDs that the given agent is in (queries Slack API)."""
-    from ..slack import bot_client
+    from .api import bot_client
     try:
         result = []
         cursor = None

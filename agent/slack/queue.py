@@ -1,27 +1,13 @@
-"""New-message queue, async notification, and drain."""
+"""New-message queue and drain."""
 
 import asyncio
 import threading
 from .store import channels, update, save, save_last_ts
-from ..slack import my_user_id, user_name, channel_name
+from .api import user_name, channel_name
 
 _new: list[tuple[str, dict]] = []
 _seen: set[str] = set()
 _lock = threading.Lock()
-
-_loop: asyncio.AbstractEventLoop | None = None
-_notify: asyncio.Event | None = None
-
-
-def init_notify():
-    global _loop, _notify
-    _loop = asyncio.get_running_loop()
-    _notify = asyncio.Event()
-
-
-def _wake():
-    if _loop and _notify:
-        _loop.call_soon_threadsafe(_notify.set)
 
 
 def enqueue(channel_id: str, msg: dict):
@@ -33,29 +19,20 @@ def enqueue(channel_id: str, msg: dict):
         _seen.add(ts)
         _new.append((channel_id, msg))
     update(channel_id, msg)
-    _wake()
 
 
 async def on_new_msg() -> list[str]:
     """Block until new messages arrive, then return list of channel IDs."""
-    if _notify:
-        await _notify.wait()
-        _notify.clear()
-
-    await asyncio.sleep(1)
-
-    with _lock:
-        if not _new:
-            return []
-        channel_ids = list(dict.fromkeys(cid for cid, _ in _new))
-
-    with _lock:
-        if _new:
+    while True:
+        await asyncio.sleep(1)
+        with _lock:
+            if not _new:
+                continue
+            channel_ids = list(dict.fromkeys(cid for cid, _ in _new))
             latest_ts = max(m.get('ts', '0') for _, m in _new)
-            save_last_ts(latest_ts)
-    save()
-
-    return channel_ids
+        save_last_ts(latest_ts)
+        save()
+        return channel_ids
 
 
 def render_channel(channel_id: str) -> str | None:

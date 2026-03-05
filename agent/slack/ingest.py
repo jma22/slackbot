@@ -1,6 +1,6 @@
 """Message ingestion: Socket Mode handler, DM polling, catchup."""
 
-from ..slack import (
+from .api import (
     my_user_id, list_channels as slack_list_channels, fetch_messages,
 )
 from .store import catchup, load_last_ts

@@ -6,8 +6,8 @@ from claude_agent_sdk import (
     AssistantMessage, UserMessage, SystemMessage, TextBlock, ToolUseBlock,
     tool, create_sdk_mcp_server,
 )
-from .slack import user_client, bot_client
-from . import history
+from .slack.api import user_client, bot_client
+from . import slack
 
 NAME, ROLE = "Jordan", "Senior Software Engineer"
 SESSION_FILE = Path(__file__).parent / ".session_id"
@@ -91,8 +91,8 @@ async def _run(prompt: str, **kwargs):
             _save_session(_session_id)
 
 
-async def init(history_text: str | None):
-    """Start a fresh session (with full history) or resume an existing one."""
+async def init(slack_text: str | None):
+    """Start a fresh session (with full slack) or resume an existing one."""
     global _session_id, bot_user_id
     _session_id = _load_session()
 
@@ -111,17 +111,17 @@ async def init(history_text: str | None):
     else:
         print("  Starting new session...")
         await _run(
-            f"Here's your complete Slack history. Get familiar with the ongoing conversations.\n\n{history_text}",
+            f"Here's your complete Slack slack. Get familiar with the ongoing conversations.\n\n{slack_text}",
             system_prompt=SYSTEM_PROMPT,
         )
 
 
 async def new_message(channel_id: str):
     """Called by the server when a new message arrives in a channel this agent is in."""
-    text = history.render_channel(channel_id)
+    text = slack.render_channel(channel_id)
     if not text:
         return
-    # history.drain_channel(channel_id)
+    # slack.drain_channel(channel_id)
     await _run(
         text + "\n\nRespond to anything that makes sense for you. Don't reply to everything.",
         resume=_session_id,

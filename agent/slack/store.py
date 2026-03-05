@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from ..slack import (
+from .api import (
     my_user_id, user_name, channel_name,
     list_channels as slack_list_channels, fetch_messages, fetch_thread_replies,
 )
