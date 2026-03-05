@@ -64,8 +64,8 @@ def handle_new_message(channel_id: str, message: dict, channel_type: str):
         return
 
     # Skip bot messages
-    if message.get("bot_id") or message.get("subtype"):
-        return
+    # if message.get("bot_id") or message.get("subtype"):
+    #     return
 
     print(f"\nNew message in {channel_type} ({channel_id}): {text}")
 
