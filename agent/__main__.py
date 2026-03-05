@@ -1,42 +1,17 @@
-"""Server: owns History and Agents, runs the main event loop."""
+"""Main entry point: starts history, initializes agents, runs the event loop."""
 
 import sys
 sys.stdout.reconfigure(line_buffering=True)
 
 import asyncio
-import os
 import signal
 import time
-import threading
 from dotenv import load_dotenv
-from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 load_dotenv()
 
-from .slack import init as init_slack, join_all_public_channels
 from . import history
 from . import bot
-
-DM_POLL_INTERVAL = 5
-
-app = App(token=os.environ['SLACK_BOT_TOKEN'])
-
-
-@app.event("channel_created")
-def on_channel_created(event, **_):
-    cid = event['channel']['id']
-    name = event['channel']['name']
-    try:
-        app.client.conversations_join(channel=cid)
-        print(f"Auto-joined #{name}")
-    except Exception as e:
-        print(f"Could not auto-join #{name}: {e}")
-
-
-@app.event("message")
-def on_message_event(event, **_):
-    history.on_message(event)
 
 
 async def main():
@@ -62,6 +37,7 @@ async def main():
 
     # Bind message notification to this event loop
     history.init_notify(asyncio.get_running_loop())
+    history.start()
 
     print("Initializing agent session...")
     await bot.init(None if bot.has_session() else history.render())
@@ -80,18 +56,6 @@ async def main():
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
 
-    # DM polling in background
-    def dm_poll_loop():
-        while not shutting_down:
-            try:
-                history.poll_dms()
-            except Exception as e:
-                print(f"DM poll error: {e}")
-            time.sleep(DM_POLL_INTERVAL)
-
-    threading.Thread(target=dm_poll_loop, daemon=True).start()
-
-    # Main loop
     while not shutting_down:
         new_msgs = await history.on_new_msg()
         if not new_msgs:
