@@ -6,7 +6,8 @@ from claude_agent_sdk import (
     AssistantMessage, UserMessage, SystemMessage, TextBlock, ToolUseBlock,
     tool, create_sdk_mcp_server,
 )
-from .slack import user_client
+from .slack import user_client, bot_client
+from . import history
 
 NAME, ROLE = "Jordan", "Senior Software Engineer"
 SESSION_FILE = Path(__file__).parent / ".session_id"
@@ -37,6 +38,7 @@ Only reply where your input would be natural. Don't reply to everything."""
     },
     "required": ["channel_id", "text"],
 })
+
 async def _send_message(args):
     kwargs = {"channel": args["channel_id"], "text": args["text"]}
     if args.get("thread_ts"):
@@ -47,6 +49,7 @@ async def _send_message(args):
 
 _server = create_sdk_mcp_server("slack", tools=[_send_message])
 _session_id: str | None = None
+bot_user_id: str = ""
 
 
 def has_session() -> bool:
@@ -89,9 +92,15 @@ async def _run(prompt: str, **kwargs):
 
 
 async def init(history_text: str | None):
-    """Start a fresh session (with full history) or resume an existing one (no history needed)."""
-    global _session_id
+    """Start a fresh session (with full history) or resume an existing one."""
+    global _session_id, bot_user_id
     _session_id = _load_session()
+
+    # Resolve bot user ID for channel listing
+    try:
+        bot_user_id = bot_client.auth_test()['user_id']
+    except Exception:
+        bot_user_id = ""
 
     if _session_id:
         print(f"  Resuming session {_session_id[:8]}...")
@@ -107,10 +116,14 @@ async def init(history_text: str | None):
         )
 
 
-async def respond(new_messages_text: str):
-    """Resume the session with new messages."""
+async def new_message(channel_id: str):
+    """Called by the server when a new message arrives in a channel this agent is in."""
+    text = history.render_channel(channel_id)
+    if not text:
+        return
+    # history.drain_channel(channel_id)
     await _run(
-        new_messages_text + "\n\nRespond to anything that makes sense for you. Don't reply to everything.",
+        text + "\n\nRespond to anything that makes sense for you. Don't reply to everything.",
         resume=_session_id,
     )
 
