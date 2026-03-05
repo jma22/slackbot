@@ -113,6 +113,57 @@ def catchup(oldest: str) -> list[tuple[str, dict]]:
     return new
 
 
+def read_channel(
+    channel: str,
+    oldest: str = "0",
+    latest: str = "9999999999.999999",
+    limit: int = 100,
+    inclusive: bool = False,
+) -> list[dict]:
+    """Read messages from a channel, newest first."""
+    result = []
+    for m in messages.get(channel, []):
+        ts = m.get('ts', '0')
+        if inclusive:
+            if ts < oldest or ts > latest:
+                continue
+        else:
+            if ts <= oldest or ts >= latest:
+                continue
+        result.append(m)
+    result.reverse()
+    return result[:limit]
+
+
+def read_thread(
+    channel: str,
+    ts: str,
+    oldest: str = "0",
+    latest: str = "9999999999.999999",
+    limit: int = 100,
+    inclusive: bool = False,
+) -> list[dict]:
+    """Read replies in a thread, parent first then chronological."""
+    parent = None
+    for m in messages.get(channel, []):
+        if m.get('ts') == ts:
+            parent = m
+            break
+    if parent is None:
+        return []
+    result = [parent]
+    for r in parent.get('_replies', []):
+        r_ts = r.get('ts', '0')
+        if inclusive:
+            if r_ts < oldest or r_ts > latest:
+                continue
+        else:
+            if r_ts <= oldest or r_ts >= latest:
+                continue
+        result.append(r)
+    return result[:limit]
+
+
 def load_last_ts() -> str:
     try:
         return _CURSOR_FILE.read_text().strip() or '0'

@@ -1,7 +1,9 @@
 """Slack clients, name resolution, and API helpers."""
 
 import os
+import time
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 user_client = WebClient(token=os.environ['SLACK_USER_TOKEN'])
 bot_client = WebClient(token=os.environ['SLACK_BOT_TOKEN'])
@@ -11,10 +13,22 @@ _name_cache: dict[str, str] = {}
 
 
 def _paginate(method, key: str, **kwargs) -> list[dict]:
-    """Generic Slack API pagination."""
-    result, cursor = [], None
+    """Generic Slack API pagination with rate-limit handling."""
+    result, cursor, page = [], None, 0
     while True:
-        r = method(cursor=cursor, limit=200, **kwargs)
+        page += 1
+        try:
+            t0 = time.time()
+            r = method(cursor=cursor, limit=200, **kwargs)
+            elapsed = time.time() - t0
+            # print(f"  [slack] {method.__name__} page={page} got={len(r[key])} {elapsed:.1f}s")
+        except SlackApiError as e:
+            if e.response.status_code == 429:
+                retry_after = int(e.response.headers.get('Retry-After', 5))
+                print(f"  [slack] RATE LIMITED on {method.__name__} — waiting {retry_after}s")
+                time.sleep(retry_after)
+                continue
+            raise
         result.extend(r[key])
         cursor = r.get('response_metadata', {}).get('next_cursor')
         if not cursor:
@@ -52,14 +66,27 @@ def list_channels(types: str = "public_channel,private_channel,mpim,im") -> list
 
 def fetch_messages(channel_id: str, oldest: str = "0") -> list[dict]:
     """Fetch top-level messages in chronological order."""
+    # print(f"  [slack] fetch_messages({channel_id}, oldest={oldest})")
     msgs = _paginate(user_client.conversations_history, 'messages', channel=channel_id, oldest=oldest)
+    # print(f"  [slack] fetch_messages({channel_id}) -> {len(msgs)} messages")
     msgs.reverse()
     return msgs
 
 
 def fetch_thread_replies(channel_id: str, thread_ts: str) -> list[dict]:
     """Fetch thread replies (excludes parent)."""
-    msgs = user_client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200).get('messages', [])
+    # print(f"  [slack] fetch_thread_replies({channel_id}, {thread_ts})")
+    try:
+        msgs = user_client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200).get('messages', [])
+    except SlackApiError as e:
+        if e.response.status_code == 429:
+            retry_after = int(e.response.headers.get('Retry-After', 5))
+            print(f"  [slack] RATE LIMITED on conversations_replies — waiting {retry_after}s")
+            time.sleep(retry_after)
+            msgs = user_client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200).get('messages', [])
+        else:
+            raise
+    print(f"  [slack] fetch_thread_replies -> {len(msgs) - 1} replies")
     return msgs[1:]
 
 

@@ -1,8 +1,10 @@
 """Main entry point: starts slack, initializes agents, runs the event loop."""
 
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+
 import asyncio
 import signal
-import sys
 import time
 from dotenv import load_dotenv
 
@@ -39,20 +41,20 @@ async def main():
     signal.signal(signal.SIGTERM, request_shutdown)
 
     while not shutting_down:
-        channels_with_new = await slack.on_new_msg()
-        if not channels_with_new:
+        new_msgs = await slack.on_new_msg()
+        if not new_msgs:
             continue
 
-        print(f"[{time.strftime('%H:%M:%S')}] New messages in {len(channels_with_new)} channel(s)")
+        print(f"[{time.strftime('%H:%M:%S')}] {len(new_msgs)} new message event(s)")
 
         for agent in agents:
             agent_channels = set(slack.list_channels(agent))
-            for ch in channels_with_new:
-                if ch in agent_channels:
+            for msg_info in new_msgs:
+                if msg_info["channel"] in agent_channels:
                     try:
-                        await agent.new_message(ch)
+                        await agent.new_message(msg_info["channel"], msg_info.get("thread_ts"))
                     except Exception as e:
-                        print(f"Agent error in {ch}: {e}")
+                        print(f"Agent error in {msg_info['channel']}: {e}")
         print()
 
     print("Goodbye")
