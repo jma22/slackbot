@@ -1,3 +1,9 @@
 logs/
 personas.json
 .env
+__pycache__/
+*.pyc
+venv/
+agent/.session_id
+agent/.last_ts
+agent/.history.json
