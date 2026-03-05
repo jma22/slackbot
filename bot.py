@@ -3,6 +3,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from pathlib import Path
 from dotenv import load_dotenv
 import anthropic
+import json
 import sys
 import os
 
@@ -19,6 +20,19 @@ history = {}
 user_names = {}
 # channel_id -> channel name cache
 channel_names = {}
+PERSONAS_FILE = Path('personas.json')
+
+# persona_name -> {"name": ..., "role": ...}
+def load_personas():
+    if PERSONAS_FILE.exists():
+        return json.loads(PERSONAS_FILE.read_text())
+    return {}
+
+def save_personas():
+    PERSONAS_FILE.write_text(json.dumps(personas, indent=2))
+
+personas = load_personas()
+print(personas)
 
 
 def get_user_name(user_id):
@@ -123,6 +137,45 @@ def history_to_string():
     return "\n".join(lines)
 
 
+def persona_reply(persona, messages):
+    """Ask a persona to respond. Returns reply text, or None if it chose not to respond."""
+    system = (
+        f"you are {persona['name']}, a {persona['role']} at a company, chatting in slack with coworkers.\n"
+        f"your vibe: casual, real, like a normal person texting at work. you have opinions and you share them.\n"
+        f"style rules — follow these strictly:\n"
+        f"- all lowercase, always\n"
+        f"- short. like 1-2 sentences max. no essays\n"
+        f"- no punctuation at the end of messages\n"
+        f"- use filler words naturally: lol, lmk, tbh, ngl, imo, rn, omg, yeah, yep, nah, fr, ok, gotcha, makes sense, for sure, true, fair\n"
+        f"- contractions always (don't, can't, it's)\n"
+        f"- never sound like an assistant or ai. no bullet points, no headers, no 'great question'\n"
+        f"only chime in if the message is relevant to your work as a {persona['role']} or if someone's asking something you'd naturally have a take on.\n"
+        f"if it's not relevant to you at all, reply with exactly: NO_RESPONSE"
+    )
+    response = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        system=system,
+        messages=messages,
+    )
+    text = response.content[0].text.strip()
+    return None if text == "NO_RESPONSE" else text
+
+
+@app.command("/persona")
+def create_persona(ack, respond, command):
+    ack()
+    parts = command['text'].strip().split(None, 1)
+    if len(parts) < 2:
+        respond("Usage: `/persona <name> <role>` — e.g. `/persona Alex software engineer`")
+        return
+    p_name, p_role = parts
+    personas[p_name] = {"name": p_name, "role": p_role}
+    save_personas()
+    print(f"Created persona: {p_name} ({p_role})")
+    respond(f"Created persona *{p_name}* — {p_role}.")
+
+
 @app.event("message")
 def reply_to_message(message, say):
     if message.get('subtype') == 'bot_message' or message.get('bot_id'):
@@ -137,22 +190,25 @@ def reply_to_message(message, say):
 
     history[ch_name].append({"role": "user", "content": f"{user_name}: {user_text}"})
 
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        messages=history[ch_name],
-    )
-    reply = response.content[0].text
-    print(f"[{ch_name}] Claude: {reply}")
-
-    history[ch_name].append({"role": "assistant", "content": reply})
-    say(reply)
+    print(f"personas: {list(personas.keys())}")
+    for persona in personas.values():
+        try:
+            reply = persona_reply(persona, history[ch_name])
+        except Exception as e:
+            print(f"Error from persona {persona['name']}: {e}")
+            continue
+        print(f"[{ch_name}] persona_reply {persona['name']} -> {reply!r}")
+        if reply:
+            print(f"[{ch_name}] {persona['name']}: {reply}")
+            history[ch_name].append({"role": "assistant", "content": reply})
+            app.client.chat_postMessage(
+                channel=message['channel'],
+                text=reply,
+                username=persona['name'],
+                icon_emoji=persona.get('icon_emoji', ':bust_in_silhouette:'),
+            )
 
 if __name__ == "__main__":
     load_all_history()
-    for ch_name, msgs in history.items():
-        print(f"\n--- {ch_name} ---")
-        for msg in msgs:
-            print(f"  [{msg['role']}] {msg['content'][:100]}")
     app.client.chat_postMessage(channel='#general', text='Bot is online!')
     SocketModeHandler(app, os.environ['SLACK_APP_TOKEN']).start()
