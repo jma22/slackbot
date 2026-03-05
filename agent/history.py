@@ -4,6 +4,8 @@ Persisted to disk. Absorbs the old messages.py functionality: Socket Mode
 ingestion, DM polling, dedup, async notification, and drain.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import threading
@@ -272,8 +274,14 @@ def poll_dms():
 
 # ───────────────────── on_new_msg / drain ─────────────────────
 
-async def on_new_msg() -> list[str]:
-    """Block until new messages arrive, then return list of channel IDs with new messages."""
+async def on_new_msg() -> list[dict]:
+    """Block until new messages arrive, then return info about each new message.
+
+    Returns a list of dicts, each with:
+        - channel: str (channel ID)
+        - thread_ts: str | None (set if this is a thread reply)
+    Deduplicated by (channel, thread_ts) pair.
+    """
     if _notify:
         await _notify.wait()
         _notify.clear()
@@ -284,7 +292,15 @@ async def on_new_msg() -> list[str]:
     with _lock:
         if not _new:
             return []
-        channel_ids = list(dict.fromkeys(cid for cid, _ in _new))
+        # Build deduplicated list of (channel, thread_ts) notifications
+        seen_keys = set()
+        result = []
+        for cid, m in _new:
+            thread_ts = m.get('thread_ts') if m.get('thread_ts') != m.get('ts') else None
+            key = (cid, thread_ts)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                result.append({"channel": cid, "thread_ts": thread_ts})
 
     # Persist cursor
     with _lock:
@@ -293,7 +309,7 @@ async def on_new_msg() -> list[str]:
             _save_last_ts(latest_ts)
     save()
 
-    return channel_ids
+    return result
 
 
 def drain_channel(channel_id: str):
@@ -303,6 +319,23 @@ def drain_channel(channel_id: str):
         # If queue is fully empty, clear seen set
         if not _new:
             _seen.clear()
+
+
+
+# ───────────────────── Cursor persistence ─────────────────────
+
+def _load_last_ts() -> str:
+    try:
+        return _CURSOR_FILE.read_text().strip() or '0'
+    except FileNotFoundError:
+        return '0'
+
+
+def _save_last_ts(ts: str):
+    _CURSOR_FILE.write_text(ts)
+
+
+#------------------------- exposed API -----------------#
 
 
 def list_channels(agent) -> list[str]:
@@ -327,15 +360,85 @@ def list_channels(agent) -> list[str]:
         print(f"  Error listing channels for agent: {e}")
         return list(channels.keys())
 
+def read_channel(
+    channel: str,
+    oldest: str = "0",
+    latest: str = "9999999999.999999",
+    limit: int = 100,
+    inclusive: bool = False,
+) -> list[dict]:
+    """Read messages from a channel. Mirrors Slack conversations.history API.
 
-# ───────────────────── Cursor persistence ─────────────────────
+    Args:
+        channel: Channel ID.
+        oldest: Only messages after this timestamp (exclusive, unless inclusive=True).
+        latest: Only messages before this timestamp (exclusive, unless inclusive=True).
+        limit: Maximum number of messages to return.
+        inclusive: Include messages with oldest/latest timestamps.
 
-def _load_last_ts() -> str:
-    try:
-        return _CURSOR_FILE.read_text().strip() or '0'
-    except FileNotFoundError:
-        return '0'
+    Returns:
+        List of message dicts in reverse chronological order (newest first),
+        matching Slack's conversations.history response format.
+    """
+    all_msgs = messages.get(channel, [])
+    result = []
+    for m in all_msgs:
+        ts = m.get('ts', '0')
+        if inclusive:
+            if ts < oldest or ts > latest:
+                continue
+        else:
+            if ts <= oldest or ts >= latest:
+                continue
+        result.append(m)
+    # Slack returns newest first
+    result.reverse()
+    return result[:limit]
 
 
-def _save_last_ts(ts: str):
-    _CURSOR_FILE.write_text(ts)
+def read_thread(
+    channel: str,
+    ts: str,
+    oldest: str = "0",
+    latest: str = "9999999999.999999",
+    limit: int = 100,
+    inclusive: bool = False,
+) -> list[dict]:
+    """Read replies in a thread. Mirrors Slack conversations.replies API.
+
+    Args:
+        channel: Channel ID.
+        ts: Thread parent timestamp.
+        oldest: Only messages after this timestamp (exclusive, unless inclusive=True).
+        latest: Only messages before this timestamp (exclusive, unless inclusive=True).
+        limit: Maximum number of messages to return.
+        inclusive: Include messages with oldest/latest timestamps.
+
+    Returns:
+        List of message dicts starting with the parent message, then replies
+        in chronological order, matching Slack's conversations.replies response format.
+    """
+    all_msgs = messages.get(channel, [])
+
+    # Find the parent message
+    parent = None
+    for m in all_msgs:
+        if m.get('ts') == ts:
+            parent = m
+            break
+    if parent is None:
+        return []
+
+    # Start with parent, then filter replies
+    result = [parent]
+    for r in parent.get('_replies', []):
+        r_ts = r.get('ts', '0')
+        if inclusive:
+            if r_ts < oldest or r_ts > latest:
+                continue
+        else:
+            if r_ts <= oldest or r_ts >= latest:
+                continue
+        result.append(r)
+
+    return result[:limit]

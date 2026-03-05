@@ -1,5 +1,7 @@
 """Agent persona, tool, and session management."""
 
+from __future__ import annotations
+
 from pathlib import Path
 from claude_agent_sdk import (
     query, ClaudeAgentOptions, ResultMessage,
@@ -39,6 +41,8 @@ Only reply where your input would be natural. Don't reply to everything."""
     "required": ["channel_id", "text"],
 })
 
+
+
 async def _send_message(args):
     kwargs = {"channel": args["channel_id"], "text": args["text"]}
     if args.get("thread_ts"):
@@ -47,7 +51,91 @@ async def _send_message(args):
     return {"content": [{"type": "text", "text": f"Sent (ts: {result['ts']})"}]}
 
 
-_server = create_sdk_mcp_server("slack", tools=[_send_message])
+@tool("read_channel", "Read message history from a Slack channel. Returns messages newest-first.", {
+    "type": "object",
+    "properties": {
+        "channel": {"type": "string", "description": "Channel ID."},
+        "oldest": {"type": "string", "description": "Only messages after this timestamp (exclusive). Default '0'."},
+        "latest": {"type": "string", "description": "Only messages before this timestamp (exclusive). Default far future."},
+        "limit": {"type": "integer", "description": "Max messages to return. Default 100."},
+        "inclusive": {"type": "boolean", "description": "Include oldest/latest boundary messages. Default false."},
+    },
+    "required": ["channel"],
+})
+async def _read_channel(args):
+    from .slack import user_name
+    msgs = history.read_channel(
+        channel=args["channel"],
+        oldest=args.get("oldest", "0"),
+        latest=args.get("latest", "9999999999.999999"),
+        limit=args.get("limit", 100),
+        inclusive=args.get("inclusive", False),
+    )
+    lines = []
+    for m in msgs:
+        uid = m.get('user', '')
+        name = user_name(uid) if uid else m.get('username', '?')
+        ts = m.get('ts', '')
+        thread_ts = m.get('thread_ts', '')
+        tag = f"[ts:{ts}"
+        if thread_ts and thread_ts != ts:
+            tag += f" thread:{thread_ts}"
+        tag += "]"
+        reply_count = len(m.get('_replies', []))
+        replies_tag = f" ({reply_count} replies)" if reply_count > 0 else ""
+        lines.append(f"{tag} {name}: {m.get('text', '')}{replies_tag}")
+    text = "\n".join(lines) if lines else "(no messages)"
+    return {"content": [{"type": "text", "text": text}]}
+
+
+@tool("list_channels", "List all Slack channels, DMs, and group DMs you have access to.", {
+    "type": "object",
+    "properties": {},
+})
+async def _list_channels(_args):
+    from .slack import channel_name
+    lines = []
+    for cid, ch in history.channels.items():
+        name = channel_name(ch)
+        msg_count = len(history.messages.get(cid, []))
+        lines.append(f"{cid}: #{name} ({msg_count} messages)")
+    text = "\n".join(lines) if lines else "(no channels)"
+    return {"content": [{"type": "text", "text": text}]}
+
+@tool("read_thread", "Read replies in a thread. Takes channel ID and the parent message's ts (thread_ts). Returns parent + replies in chronological order.", {
+    "type": "object",
+    "properties": {
+        "channel": {"type": "string", "description": "Channel ID."},
+        "ts": {"type": "string", "description": "Thread parent timestamp (thread_ts)."},
+        "oldest": {"type": "string", "description": "Only replies after this timestamp (exclusive). Default '0'."},
+        "latest": {"type": "string", "description": "Only replies before this timestamp (exclusive). Default far future."},
+        "limit": {"type": "integer", "description": "Max messages to return. Default 100."},
+        "inclusive": {"type": "boolean", "description": "Include oldest/latest boundary messages. Default false."},
+    },
+    "required": ["channel", "ts"],
+})
+async def _read_thread(args):
+    from .slack import user_name
+    msgs = history.read_thread(
+        channel=args["channel"],
+        ts=args["ts"],
+        oldest=args.get("oldest", "0"),
+        latest=args.get("latest", "9999999999.999999"),
+        limit=args.get("limit", 100),
+        inclusive=args.get("inclusive", False),
+    )
+    lines = []
+    for i, m in enumerate(msgs):
+        uid = m.get('user', '')
+        name = user_name(uid) if uid else m.get('username', '?')
+        ts = m.get('ts', '')
+        prefix = "" if i == 0 else "  "
+        lines.append(f"{prefix}[ts:{ts}] {name}: {m.get('text', '')}")
+    text = "\n".join(lines) if lines else "(no thread found)"
+    return {"content": [{"type": "text", "text": text}]}
+
+
+_server = create_sdk_mcp_server("slack", tools=[_send_message, _read_channel, _list_channels, _read_thread])
 _session_id: str | None = None
 bot_user_id: str = ""
 
@@ -116,16 +204,26 @@ async def init(history_text: str | None):
         )
 
 
-async def new_message(channel_id: str):
+async def new_message(channel_id: str, thread_ts: str | None = None):
     """Called by the server when a new message arrives in a channel this agent is in."""
-    text = history.render_channel(channel_id)
-    if not text:
-        return
-    # history.drain_channel(channel_id)
-    await _run(
-        text + "\n\nRespond to anything that makes sense for you. Don't reply to everything.",
-        resume=_session_id,
-    )
+    ch = history.channels.get(channel_id)
+    from .slack import channel_name
+    name = channel_name(ch) if ch else channel_id
+    if thread_ts:
+        print(f"  New reply in thread {thread_ts} in #{name} ({channel_id})")
+        prompt = f"New reply in thread {thread_ts} in #{name} ({channel_id}). Use read_thread to see the conversation and respond if appropriate."
+    else:
+        print(f"  New message in #{name} ({channel_id})")
+        prompt = f"New message in #{name} ({channel_id}). Use your tools to read and respond if appropriate."
+    await _run(prompt, resume=_session_id)
+
+
+def _safe_print(text: str):
+    """Print text, replacing unencodable characters for Windows consoles."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", errors="replace").decode("ascii"))
 
 
 def _log(msg):
@@ -135,20 +233,20 @@ def _log(msg):
             b.text[:100] if isinstance(b, TextBlock) else f"[{type(b).__name__}]"
             for b in msg.content
         ]
-        print(f"  >> User: {content}")
+        _safe_print(f"  >> User: {content}")
     elif isinstance(msg, AssistantMessage):
         for block in msg.content:
             if isinstance(block, TextBlock):
-                print(f"  << Assistant: {block.text[:200]}")
+                _safe_print(f"  << Assistant: {block.text[:200]}")
             elif isinstance(block, ToolUseBlock):
-                print(f"  << Tool call: {block.name}({block.input})")
+                _safe_print(f"  << Tool call: {block.name}({block.input})")
             else:
-                print(f"  << [{type(block).__name__}]")
+                _safe_print(f"  << [{type(block).__name__}]")
     elif isinstance(msg, SystemMessage):
-        print(f"  -- System [{msg.subtype}]")
+        _safe_print(f"  -- System [{msg.subtype}]")
     elif isinstance(msg, ResultMessage):
-        print(f"  == Result: {msg.result}")
+        _safe_print(f"  == Result: {msg.result}")
         if msg.usage:
-            print(f"     Usage: {msg.usage}")
+            _safe_print(f"     Usage: {msg.usage}")
         if msg.total_cost_usd:
-            print(f"     Cost: ${msg.total_cost_usd:.4f}")
+            _safe_print(f"     Cost: ${msg.total_cost_usd:.4f}")
