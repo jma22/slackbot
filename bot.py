@@ -6,8 +6,11 @@ import anthropic
 import json
 import sys
 import os
+import time
+from pydantic import BaseModel
 
-sys.stdout.reconfigure(line_buffering=True)
+
+sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
 
 load_dotenv(dotenv_path=Path('.') / '.env')
 
@@ -130,36 +133,12 @@ def history_to_string():
     for ch_name, msgs in history.items():
         lines.append(f"--- {ch_name} ---")
         for msg in msgs:
-            speaker = "Bot" if msg['role'] == "assistant" else msg['content'].split(":")[0]
+            speaker = "weewoo" if msg['role'] == "assistant" else msg['content'].split(":")[0]
             text = msg['content'] if msg['role'] == "assistant" else ":".join(msg['content'].split(":")[1:]).strip()
             lines.append(f"{speaker}: {text}")
         lines.append("")
     return "\n".join(lines)
 
-
-def persona_reply(persona, messages):
-    """Ask a persona to respond. Returns reply text, or None if it chose not to respond."""
-    system = (
-        f"you are {persona['name']}, a {persona['role']} at a company, chatting in slack with coworkers.\n"
-        f"your vibe: casual, real, like a normal person texting at work. you have opinions and you share them.\n"
-        f"style rules — follow these strictly:\n"
-        f"- all lowercase, always\n"
-        f"- short. like 1-2 sentences max. no essays\n"
-        f"- no punctuation at the end of messages\n"
-        f"- use filler words naturally: lol, lmk, tbh, ngl, imo, rn, omg, yeah, yep, nah, fr, ok, gotcha, makes sense, for sure, true, fair\n"
-        f"- contractions always (don't, can't, it's)\n"
-        f"- never sound like an assistant or ai. no bullet points, no headers, no 'great question'\n"
-        f"only chime in if the message is relevant to your work as a {persona['role']} or if someone's asking something you'd naturally have a take on.\n"
-        f"if it's not relevant to you at all, reply with exactly: NO_RESPONSE"
-    )
-    response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        system=system,
-        messages=messages,
-    )
-    text = response.content[0].text.strip()
-    return None if text == "NO_RESPONSE" else text
 
 
 @app.command("/persona")
@@ -174,10 +153,92 @@ def create_persona(ack, respond, command):
     save_personas()
     print(f"Created persona: {p_name} ({p_role})")
     respond(f"Created persona *{p_name}* — {p_role}.")
+class ReplyDecision(BaseModel):
+    need_reply: bool
+    reason: str
+    channel_to_reply: str = None
+    reply_content: str = None
+
+class ReplyRequest(BaseModel):
+    replies: list[ReplyDecision]
+
+
+def get_channel_id(channel_name):
+    """Reverse lookup: channel name -> channel ID."""
+    for ch_id, ch_name in channel_names.items():
+        if ch_name == channel_name:
+            return ch_id
+    return None
+
+
+def check_if_need_reply(persona):
+    history_string = history_to_string()
+    prompt = f"""you are {persona['name']}, a {persona['role']} at a company, chatting in slack with coworkers.
+your vibe: casual, real, like a normal person texting at work. you have opinions and you share them.
+
+style rules — follow these strictly:
+- all lowercase, always
+- short. like 1-2 sentences max. no essays
+- no punctuation at the end of messages
+- use filler words naturally: lol, lmk, tbh, ngl, imo, rn, omg, yeah, yep, nah, fr, ok, gotcha, makes sense, for sure, true, fair
+- contractions always (don't, can't, it's)
+- never sound like an assistant or ai. no bullet points, no headers, no 'great question'
+
+given the slack conversation history below, decide if you need to reply in any channel.
+
+reply if:
+- someone's asking something relevant to your work as a {persona['role']} or something you'd naturally have a take on
+- a conversation is directed at you or waiting for your response
+
+do NOT reply if:
+- you already replied and no new messages came after
+- the conversation has nothing to do with you or your expertise
+
+conversation history:
+{history_string}
+
+return a list of replies to send. only reply in channels where it makes sense for a {persona['role']} to chime in."""
+
+    print(prompt)
+    response = claude.messages.parse(
+        model="claude-opus-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+        output_format=ReplyRequest,
+    )
+
+    parsed = response.content[0].parsed_output
+    print(f"{persona['name']} response: {parsed}")
+
+    logs_dir = Path('logs')
+    logs_dir.mkdir(exist_ok=True)
+    log_path = logs_dir / f"{persona['name']}_{int(time.time())}.log"
+    log_path.write_text(f"=== PROMPT ===\n{prompt}\n\n=== RESPONSE ===\n{parsed}\n")
+
+    for reply in parsed.replies:
+        if reply.need_reply and reply.channel_to_reply and reply.reply_content:
+            ch_id = get_channel_id(reply.channel_to_reply)
+            if ch_id:
+                app.client.chat_postMessage(
+                    channel=ch_id,
+                    text=reply.reply_content,
+                    username=persona['name'],
+                    icon_emoji=persona.get('icon_emoji', ':bust_in_silhouette:'),
+                )
+                update_history(reply.channel_to_reply, "assistant", reply.reply_content)
+            else:
+                print(f"Could not find channel ID for {reply.channel_to_reply}")
+
+
+
+def update_history(ch_name, role, content):
+    if ch_name not in history:
+        history[ch_name] = []
+    history[ch_name].append({"role": role, "content": content})
 
 
 @app.event("message")
-def reply_to_message(message, say):
+def reply_to_message(message):
     if message.get('subtype') == 'bot_message' or message.get('bot_id'):
         return
     ch_name = get_channel_name(message['channel'])
@@ -185,30 +246,12 @@ def reply_to_message(message, say):
     user_name = get_user_name(message.get('user', ''))
     print(f"[{ch_name}] {user_name}: {user_text}")
 
-    if ch_name not in history:
-        history[ch_name] = []
-
-    history[ch_name].append({"role": "user", "content": f"{user_name}: {user_text}"})
-
-    print(f"personas: {list(personas.keys())}")
+    update_history(ch_name, "user", f"{user_name}: {user_text}")
     for persona in personas.values():
-        try:
-            reply = persona_reply(persona, history[ch_name])
-        except Exception as e:
-            print(f"Error from persona {persona['name']}: {e}")
-            continue
-        print(f"[{ch_name}] persona_reply {persona['name']} -> {reply!r}")
-        if reply:
-            print(f"[{ch_name}] {persona['name']}: {reply}")
-            history[ch_name].append({"role": "assistant", "content": reply})
-            app.client.chat_postMessage(
-                channel=message['channel'],
-                text=reply,
-                username=persona['name'],
-                icon_emoji=persona.get('icon_emoji', ':bust_in_silhouette:'),
-            )
+        check_if_need_reply(persona)
+    
 
 if __name__ == "__main__":
     load_all_history()
-    app.client.chat_postMessage(channel='#general', text='Bot is online!')
+    print(history_to_string())
     SocketModeHandler(app, os.environ['SLACK_APP_TOKEN']).start()
