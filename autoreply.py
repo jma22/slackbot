@@ -18,6 +18,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 # CHANNELS_TO_WATCH = ["C1234567890"]  # Add specific channel IDs to watch (leave empty [] to skip)
 CHANNELS_TO_WATCH = []  # Watch no channels, only DMs
 POLL_INTERVAL = 5  # seconds between checks
+CHANNEL_REFRESH_INTERVAL = 300  # seconds between refreshing channel list
 
 # ─────────────────────────────────────────────
 # SETUP
@@ -102,13 +103,17 @@ def handle_new_message(channel_id: str, message: dict, channel_type: str):
         print(f"Failed to send reply: {e.response['error']}")
 
 
-def get_dm_channels() -> list:
-    """Get all open DM channel IDs."""
+def get_all_channels() -> list:
+    """Get all channel/DM IDs the user is a member of."""
     try:
-        result = slack.conversations_list(types="im", limit=100)
-        return [c["id"] for c in result["channels"] if not c.get("is_user_deleted")]
+        result = slack.users_conversations(
+            types="public_channel,private_channel,mpim,im",
+            exclude_archived=True,
+            limit=200,
+        )
+        return [c["id"] for c in result["channels"]]
     except SlackApiError as e:
-        print(f"Could not fetch DMs: {e.response['error']}")
+        print(f"Could not fetch channels: {e.response['error']}")
         return []
 
 
@@ -149,8 +154,7 @@ print(f"   Poll interval: every {POLL_INTERVAL}s")
 print(f"   Tone: Casual & friendly\n")
 
 # Seed last_seen with current latest timestamps so we only reply to NEW messages
-dm_channels = get_dm_channels()
-all_channels = dm_channels + CHANNELS_TO_WATCH
+all_channels = get_all_channels()
 
 for ch in all_channels:
     try:
@@ -161,10 +165,13 @@ for ch in all_channels:
     except Exception:
         pass
 
-print(f"Monitoring {len(dm_channels)} DMs and {len(CHANNELS_TO_WATCH)} channels...\n")
+print(f"Monitoring {len(all_channels)} conversations...\n")
 
+last_channel_refresh = 0
 while True:
-    dm_channels = get_dm_channels()  # refresh DM list in case new ones open
-    poll_conversations(dm_channels, "dm")
-    poll_conversations(CHANNELS_TO_WATCH, "channel")
+    now = time.time()
+    if now - last_channel_refresh >= CHANNEL_REFRESH_INTERVAL:
+        all_channels = get_all_channels()
+        last_channel_refresh = now
+    poll_conversations(all_channels, "channel")
     time.sleep(POLL_INTERVAL)
