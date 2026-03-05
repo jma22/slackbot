@@ -1,0 +1,10 @@
+{
+  "Freddy": {
+    "name": "Freddy",
+    "role": "Software Engineer"
+  },
+  "Bob": {
+    "name": "Bob",
+    "role": "Lawyer"
+  }
+}
