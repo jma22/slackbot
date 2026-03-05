@@ -6,6 +6,7 @@ import anthropic
 import sys
 import os
 from pydantic import BaseModel
+from typing import List
 
 
 sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
@@ -15,12 +16,22 @@ load_dotenv(dotenv_path=Path('.') / '.env')
 app = App(token=os.environ['SLACK_BOT_TOKEN'])
 claude = anthropic.Anthropic()
 
+class HistoryObject(BaseModel):
+    role: str
+    content: str
+    user_id: str = None
+    channel_id: str = None
+    is_new: bool = False
+
+
+
 # channel_name -> list of {"role": ..., "content": ...} messages for Claude context
-history = {}
+history : dict[str, List[HistoryObject]] = {}
 # user_id -> display name cache
 user_names = {}
 # channel_id -> channel name cache
 channel_names = {}
+
 
 
 def get_user_name(user_id):
@@ -87,7 +98,7 @@ def load_all_history():
 def load_channel_history(channel_id, bot_user_id):
     """Load recent messages from a single channel into the history dict."""
     ch_name = get_channel_name(channel_id)
-    msgs = []
+    msgs: List[HistoryObject] = []
     try:
         result = app.client.conversations_history(channel=channel_id, limit=50)
     except Exception as e:
@@ -105,10 +116,10 @@ def load_channel_history(channel_id, bot_user_id):
         role = "assistant" if is_bot else "user"
         content = text if is_bot else f"{get_user_name(user_id)}: {text}"
         # Merge consecutive same-role messages
-        if msgs and msgs[-1]['role'] == role:
-            msgs[-1]['content'] += "\n" + content
+        if msgs and msgs[-1].role == role:
+            msgs[-1].content += "\n" + content
         else:
-            msgs.append({"role": role, "content": content})
+            msgs.append(HistoryObject(role=role, content=content, user_id=user_id, channel_id=channel_id, is_new=False))
     if msgs:
         history[ch_name] = msgs
 
@@ -118,9 +129,10 @@ def history_to_string():
     for ch_name, msgs in history.items():
         lines.append(f"--- {ch_name} ---")
         for msg in msgs:
-            speaker = "weewoo" if msg['role'] == "assistant" else msg['content'].split(":")[0]
-            text = msg['content'] if msg['role'] == "assistant" else ":".join(msg['content'].split(":")[1:]).strip()
-            lines.append(f"{speaker}: {text}")
+            prefix = "[NEW] " if msg.is_new else ""
+            speaker = "weewoo" if msg.role == "assistant" else msg.content.split(":")[0]
+            text = msg.content if msg.role == "assistant" else ":".join(msg.content.split(":")[1:]).strip()
+            lines.append(f"{prefix}{speaker}: {text}")
         lines.append("")
     return "\n".join(lines)
 
@@ -145,22 +157,22 @@ def get_channel_id(channel_name):
 
 def check_if_need_reply():
     history_string = history_to_string()
-    prompt = f"""You are a Slack bot named weewoo. Given the conversation history below, determine if you need to reply in any channel.
+    prompt = f"""You are a Slack bot named weewoo. Below is the conversation history across all channels. Messages marked with [NEW] are new and unread. Only respond to [NEW] messages.
 
 You should reply if:
-- Someone directly asked you a question or mentioned you
-- A conversation is directed at you or waiting for your response
-- The last message in a channel is from a user (not you) and seems to expect a response
+- A [NEW] message directly asks you a question or mentions you
+- A [NEW] message is directed at you or is waiting for your response
+- A [NEW] message seems to expect a response from you
 
 You should NOT reply if:
-- You already replied and no new user messages came after
-- The conversation doesn't involve you
-- Messages are between other users and don't need your input
+- There are no [NEW] messages in a channel
+- The [NEW] messages don't involve you or need your input
+- The [NEW] messages are between other users
 
 Conversation history:
 {history_string}
 
-Return a list of replies you need to send. For each, include the exact channel name from the history and your reply content."""
+Return a list of replies you need to send. For each, include the exact channel name from the history and your reply content. Only reply to channels with [NEW] messages that need your response."""
 
     print(prompt)
     response = claude.messages.parse(
@@ -177,16 +189,21 @@ Return a list of replies you need to send. For each, include the exact channel n
             ch_id = get_channel_id(reply.channel_to_reply)
             if ch_id:
                 app.client.chat_postMessage(channel=ch_id, text=reply.reply_content)
-                update_history(reply.channel_to_reply, "assistant", f"weewoo: {reply.reply_content}")
+                update_history(reply.channel_to_reply, "assistant", reply.reply_content, is_new=False)
             else:
                 print(f"Could not find channel ID for {reply.channel_to_reply}")
 
+    # Mark all messages as no longer new
+    for msgs in history.values():
+        for msg in msgs:
+            msg.is_new = False
 
 
-def update_history(ch_name, role, content):
+
+def update_history(ch_name, role, content, is_new=True):
     if ch_name not in history:
         history[ch_name] = []
-    history[ch_name].append({"role": role, "content": content})
+    history[ch_name].append(HistoryObject(role=role, content=content, is_new=is_new))
 
 
 @app.event("message")
