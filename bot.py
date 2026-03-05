@@ -121,15 +121,20 @@ def load_channel_history(channel_id, bot_user_id):
         return
     # messages come newest-first, reverse for chronological order
     for msg in reversed(result.get('messages', [])):
-        if msg.get('subtype'):
+        subtype = msg.get('subtype')
+        if subtype and subtype != 'bot_message':
             continue
         text = msg.get('text', '')
         if not text:
             continue
         user_id = msg.get('user', '')
-        is_bot = user_id == bot_user_id
+        is_bot = user_id == bot_user_id or msg.get('bot_id')
         role = "assistant" if is_bot else "user"
-        content = text if is_bot else f"{get_user_name(user_id)}: {text}"
+        if is_bot:
+            bot_name = msg.get('username', 'bot')
+            content = f"{bot_name}: {text}"
+        else:
+            content = f"{get_user_name(user_id)}: {text}"
         # Merge consecutive same-role messages
         if msgs and msgs[-1].role == role:
             msgs[-1].content += "\n" + content
@@ -145,9 +150,7 @@ def history_to_string():
         lines.append(f"--- {ch_name} ---")
         for msg in msgs:
             prefix = "[NEW] " if msg.is_new else ""
-            speaker = "weewoo" if msg.role == "assistant" else msg.content.split(":")[0]
-            text = msg.content if msg.role == "assistant" else ":".join(msg.content.split(":")[1:]).strip()
-            lines.append(f"{prefix}{speaker}: {text}")
+            lines.append(f"{prefix}{msg.content}")
         lines.append("")
     return "\n".join(lines)
 
@@ -165,6 +168,7 @@ def create_persona(ack, respond, command):
     save_personas()
     print(f"Created persona: {p_name} ({p_role})")
     respond(f"Created persona *{p_name}* — {p_role}.")
+    
 class ReplyDecision(BaseModel):
     need_reply: bool
     reason: str
@@ -240,7 +244,7 @@ return a list of replies to send. only reply in channels where [NEW] messages ex
                     username=persona['name'],
                     icon_emoji=persona.get('icon_emoji', ':bust_in_silhouette:'),
                 )
-                update_history(reply.channel_to_reply, "assistant", reply.reply_content, is_new = False)
+                update_history(reply.channel_to_reply, "assistant", f"{persona['name']}: {reply.reply_content}", is_new=False)
             else:
                 print(f"Could not find channel ID for {reply.channel_to_reply}")
 
@@ -255,7 +259,13 @@ def update_history(ch_name, role, content, is_new=True):
 
 @app.event("message")
 def reply_to_message(message):
+    # Capture bot messages in history but don't trigger replies
     if message.get('subtype') == 'bot_message' or message.get('bot_id'):
+        ch_name = get_channel_name(message['channel'])
+        bot_name = message.get('username', 'bot')
+        text = message.get('text', '')
+        if text:
+            update_history(ch_name, "assistant", f"{bot_name}: {text}", is_new=False)
         return
     ch_name = get_channel_name(message['channel'])
     user_text = message['text']
